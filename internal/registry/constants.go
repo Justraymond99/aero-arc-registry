@@ -4,3 +4,10 @@ const (
 	DebugTLSCertPath = ".aeroarc/local-certs/localhost.crt"
 	DebugTLSKeyPath  = ".aeroarc/local-certs/localhost.key"
 )
+
+const (
+	RedisRegistryBackend  RegistryBackend = "redis"
+	EtcdRegistryBackend   RegistryBackend = "etcd"
+	ConsulRegistryBackend RegistryBackend = "consul"
+	MemoryRegistryBackend RegistryBackend = "memory"
+)
