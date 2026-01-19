@@ -11,3 +11,7 @@ const (
 	ConsulRegistryBackend RegistryBackend = "consul"
 	MemoryRegistryBackend RegistryBackend = "memory"
 )
+
+var registryMap = map[string]RegistryBackend{
+	"redis": RedisRegistryBackend,
+}

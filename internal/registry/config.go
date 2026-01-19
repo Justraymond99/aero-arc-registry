@@ -1,6 +1,9 @@
 package registry
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Config defines the runtime configuration for the Aero Arc Registry service.
 // It captures transport configuration (gRPC), backend coordination configuration,
@@ -85,4 +88,84 @@ type RedisConfig struct {
 
 	// DB is the Redis logical database index to use.
 	DB int
+}
+
+func ParseRegistryBackend(backend string) (RegistryBackend, error) {
+	if registryBackend, ok := registryMap[backend]; ok {
+		return registryBackend, nil
+	}
+
+	return "", fmt.Errorf("%w: %s", ErrUnsupportedBackend, backend)
+}
+
+func (c *Config) Validate() error {
+	switch c.Backend.Type {
+	case RedisRegistryBackend:
+		if c.Backend.Redis == nil {
+			return ErrRedisConfigNil
+		}
+
+		if err := c.Backend.Redis.Validate(); err != nil {
+			return fmt.Errorf("redis config invalid: %w", err)
+		}
+	case MemoryRegistryBackend, EtcdRegistryBackend, ConsulRegistryBackend:
+	default:
+		return fmt.Errorf("unknown registry backend: %s", c.Backend.Type)
+	}
+
+	if err := c.GRPC.Validate(); err != nil {
+		return fmt.Errorf("GRPC Config invalid: %w", err)
+	}
+
+	if err := c.TTL.Validate(); err != nil {
+		return fmt.Errorf("TTL Config invalid: %w", err)
+	}
+
+	return nil
+}
+
+func (r *RedisConfig) Validate() error {
+	if r.Address == "" {
+		return ErrRedisAddrEmpty
+	}
+
+	if r.Port <= 0 {
+		return ErrRedisPortInvalid
+	}
+
+	if r.DB < 0 {
+		return ErrRedisDBInvalid
+	}
+
+	return nil
+}
+
+func (g *GRPCConfig) Validate() error {
+	if g.ListenPort <= 0 {
+		return ErrGRPCPortInvalid
+	}
+
+	if g.TLS.Enabled {
+		if g.TLS.CertPath == "" {
+			return ErrTLSCertPathMissing
+		}
+
+		if g.TLS.KeyPath == "" {
+			return ErrTLSKeyPathMissing
+		}
+	}
+
+	return nil
+}
+
+func (t *TTLConfig) Validate() error {
+	if t.Agent <= 0 {
+		return ErrTTLAgentInvalid
+	}
+
+	if t.Relay <= 0 {
+		return ErrTTLRelayInvalid
+	}
+
+	return nil
 }
