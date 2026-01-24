@@ -13,7 +13,7 @@ import (
 
 var _ registry.Backend = (*Backend)(nil)
 
-func newTestBackend(t *testing.T) (*Backend, func()) {
+func newTestBackend(t *testing.T) (*Backend, *miniredis.Miniredis, func()) {
 	t.Helper()
 
 	s, err := miniredis.Run()
@@ -32,7 +32,12 @@ func newTestBackend(t *testing.T) (*Backend, func()) {
 		t.Fatalf("parse port: %v", err)
 	}
 
-	backend, err := New(&registry.RedisConfig{Address: host, Port: port})
+	ttl := registry.TTLConfig{
+		Relay: 2 * time.Second,
+		Agent: 2 * time.Second,
+	}
+
+	backend, err := New(&registry.RedisConfig{Address: host, Port: port}, ttl)
 	if err != nil {
 		s.Close()
 		t.Fatalf("new backend: %v", err)
@@ -43,11 +48,11 @@ func newTestBackend(t *testing.T) (*Backend, func()) {
 		s.Close()
 	}
 
-	return backend, cleanup
+	return backend, s, cleanup
 }
 
 func TestBackendRelayLifecycle(t *testing.T) {
-	backend, cleanup := newTestBackend(t)
+	backend, _, cleanup := newTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -98,7 +103,7 @@ func TestBackendRelayLifecycle(t *testing.T) {
 }
 
 func TestBackendAgentPlacement(t *testing.T) {
-	backend, cleanup := newTestBackend(t)
+	backend, _, cleanup := newTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -139,5 +144,91 @@ func TestBackendAgentPlacement(t *testing.T) {
 	}
 	if placement.UpdatedAt.UnixNano() != updatedAt.UnixNano() {
 		t.Fatalf("expected updated at %v, got %v", updatedAt, placement.UpdatedAt)
+	}
+}
+
+func TestBackendRelayStaleFiltered(t *testing.T) {
+	backend, _, cleanup := newTestBackend(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	relay := registry.Relay{
+		ID:       "relay-stale",
+		Address:  "10.0.0.2",
+		GRPCPort: 60000,
+		LastSeen: time.Now().UTC().Add(-time.Minute),
+	}
+
+	if err := backend.RegisterRelay(ctx, relay); err != nil {
+		t.Fatalf("RegisterRelay: %v", err)
+	}
+
+	relays, err := backend.ListRelays(ctx)
+	if err != nil {
+		t.Fatalf("ListRelays: %v", err)
+	}
+	if len(relays) != 0 {
+		t.Fatalf("expected stale relay to be filtered, got %d", len(relays))
+	}
+}
+
+func TestBackendRelayTTLExpiry(t *testing.T) {
+	backend, server, cleanup := newTestBackend(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	relay := registry.Relay{ID: "relay-ttl", Address: "10.0.0.3", GRPCPort: 60001}
+	if err := backend.RegisterRelay(ctx, relay); err != nil {
+		t.Fatalf("RegisterRelay: %v", err)
+	}
+
+	server.FastForward(3 * time.Second)
+
+	relays, err := backend.ListRelays(ctx)
+	if err != nil {
+		t.Fatalf("ListRelays: %v", err)
+	}
+	if len(relays) != 0 {
+		t.Fatalf("expected relay to expire, got %d", len(relays))
+	}
+}
+
+func TestBackendAgentStaleFiltered(t *testing.T) {
+	backend, _, cleanup := newTestBackend(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	agent := registry.Agent{ID: "agent-stale", LastHeartbeat: time.Now().UTC().Add(-time.Minute)}
+	if err := backend.RegisterAgent(ctx, agent, "relay-9"); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	placement, err := backend.GetAgentPlacement(ctx, agent.ID)
+	if err != nil {
+		t.Fatalf("GetAgentPlacement: %v", err)
+	}
+	if placement != nil {
+		t.Fatalf("expected stale placement to be filtered, got %#v", placement)
+	}
+}
+
+func TestBackendAgentTTLExpiry(t *testing.T) {
+	backend, server, cleanup := newTestBackend(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	agent := registry.Agent{ID: "agent-ttl"}
+	if err := backend.RegisterAgent(ctx, agent, "relay-7"); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	server.FastForward(3 * time.Second)
+
+	placement, err := backend.GetAgentPlacement(ctx, agent.ID)
+	if err != nil {
+		t.Fatalf("GetAgentPlacement: %v", err)
+	}
+	if placement != nil {
+		t.Fatalf("expected placement to expire, got %#v", placement)
 	}
 }

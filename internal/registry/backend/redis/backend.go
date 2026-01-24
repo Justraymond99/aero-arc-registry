@@ -14,10 +14,11 @@ import (
 
 type Backend struct {
 	cfg *registry.RedisConfig
+	ttl registry.TTLConfig
 	rdb *redis.Client
 }
 
-func New(cfg *registry.RedisConfig) (*Backend, error) {
+func New(cfg *registry.RedisConfig, ttl registry.TTLConfig) (*Backend, error) {
 	if cfg == nil {
 		return nil, registry.ErrRedisConfigNil
 	}
@@ -38,7 +39,7 @@ func New(cfg *registry.RedisConfig) (*Backend, error) {
 		return nil, err
 	}
 
-	return &Backend{cfg: cfg, rdb: rdb}, nil
+	return &Backend{cfg: cfg, ttl: ttl, rdb: rdb}, nil
 }
 
 func (b *Backend) RegisterRelay(ctx context.Context, relay registry.Relay) error {
@@ -58,6 +59,7 @@ func (b *Backend) RegisterRelay(ctx context.Context, relay registry.Relay) error
 		"GRPCPort":     relay.GRPCPort,
 		"LastSeenUnix": relay.LastSeen.UnixNano(),
 	})
+	pipe.PExpire(ctx, key, b.ttl.Relay)
 	pipe.SAdd(ctx, relaysIndexKey, relay.ID)
 	_, err := pipe.Exec(ctx)
 	return err
@@ -75,6 +77,7 @@ func (b *Backend) HeartbeatRelay(ctx context.Context, relayID string, ts time.Ti
 	key := relayKey(relayID)
 	pipe := b.rdb.Pipeline()
 	pipe.HSet(ctx, key, "LastSeenUnix", ts.UnixNano())
+	pipe.PExpire(ctx, key, b.ttl.Relay)
 	pipe.SAdd(ctx, relaysIndexKey, relayID)
 	_, err := pipe.Exec(ctx)
 	return err
@@ -102,13 +105,17 @@ func (b *Backend) ListRelays(ctx context.Context) ([]registry.Relay, error) {
 		return nil, err
 	}
 
+	now := time.Now().UTC()
+	staleIDs := make([]string, 0)
 	relays := make([]registry.Relay, 0, len(ids))
-	for _, cmd := range cmds {
+	for i, cmd := range cmds {
+		id := ids[i]
 		data, err := cmd.Result()
 		if err != nil && !errors.Is(err, redis.Nil) {
 			return nil, err
 		}
 		if len(data) == 0 {
+			staleIDs = append(staleIDs, id)
 			continue
 		}
 
@@ -116,7 +123,24 @@ func (b *Backend) ListRelays(ctx context.Context) ([]registry.Relay, error) {
 		if err != nil {
 			return nil, err
 		}
+		if relay.LastSeen.IsZero() || now.Sub(relay.LastSeen) > b.ttl.Relay {
+			staleIDs = append(staleIDs, relay.ID)
+			continue
+		}
 		relays = append(relays, relay)
+	}
+
+	if len(staleIDs) > 0 {
+		staleArgs := make([]any, 0, len(staleIDs))
+		for _, id := range staleIDs {
+			staleArgs = append(staleArgs, id)
+		}
+		pipe := b.rdb.Pipeline()
+		for _, id := range staleIDs {
+			pipe.Del(ctx, relayKey(id))
+		}
+		pipe.SRem(ctx, relaysIndexKey, staleArgs...)
+		_, _ = pipe.Exec(ctx)
 	}
 
 	return relays, nil
@@ -154,11 +178,13 @@ func (b *Backend) RegisterAgent(ctx context.Context, agent registry.Agent, relay
 		"ID":                agent.ID,
 		"LastHeartbeatUnix": agent.LastHeartbeat.UnixNano(),
 	})
+	pipe.PExpire(ctx, agentKey(agent.ID), b.ttl.Agent)
 	pipe.HSet(ctx, placementKey(agent.ID), map[string]any{
 		"AgentID":      placement.AgentID,
 		"RelayID":      placement.RelayID,
 		"UpdatedAtUnix": placement.UpdatedAt.UnixNano(),
 	})
+	pipe.PExpire(ctx, placementKey(agent.ID), b.ttl.Agent)
 	pipe.SAdd(ctx, agentsIndexKey, agent.ID)
 	_, err := pipe.Exec(ctx)
 	return err
@@ -175,7 +201,9 @@ func (b *Backend) HeartbeatAgent(ctx context.Context, agentID string, ts time.Ti
 
 	pipe := b.rdb.Pipeline()
 	pipe.HSet(ctx, agentKey(agentID), "LastHeartbeatUnix", ts.UnixNano())
+	pipe.PExpire(ctx, agentKey(agentID), b.ttl.Agent)
 	pipe.HSet(ctx, placementKey(agentID), "UpdatedAtUnix", ts.UnixNano())
+	pipe.PExpire(ctx, placementKey(agentID), b.ttl.Agent)
 	pipe.SAdd(ctx, agentsIndexKey, agentID)
 	_, err := pipe.Exec(ctx)
 	return err
@@ -197,6 +225,14 @@ func (b *Backend) GetAgentPlacement(ctx context.Context, agentID string) (*regis
 	placement, err := parsePlacement(data)
 	if err != nil {
 		return nil, err
+	}
+	if placement.UpdatedAt.IsZero() || time.Since(placement.UpdatedAt) > b.ttl.Agent {
+		pipe := b.rdb.Pipeline()
+		pipe.Del(ctx, agentKey(agentID))
+		pipe.Del(ctx, placementKey(agentID))
+		pipe.SRem(ctx, agentsIndexKey, agentID)
+		_, _ = pipe.Exec(ctx)
+		return nil, nil
 	}
 	return &placement, nil
 }
